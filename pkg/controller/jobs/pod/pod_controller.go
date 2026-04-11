@@ -1421,6 +1421,9 @@ func GetWorkloadNameForPod(podName string, podUID types.UID) string {
 func NewGroupWorkload(name string, obj client.Object, podSets []kueue.PodSet, labelKeysToCopy []string) *kueue.Workload {
 	wl := jobframework.NewWorkload(name, obj, podSets, labelKeysToCopy)
 	wl.Annotations[podconstants.IsGroupWorkloadAnnotationKey] = podconstants.IsGroupWorkloadAnnotationValue
+	if raw := strings.TrimSpace(obj.GetAnnotations()[podconstants.GroupTotalCountAnnotation]); raw != "" {
+		wl.Annotations[podconstants.GroupTotalCountAnnotation] = raw
+	}
 
 	if features.Enabled(features.AdmissionGatedBy) {
 		jobframework.PropagateAdmissionGatedByAnnotation(obj, wl)

@@ -774,6 +774,63 @@ func (m *Manager) GetWorkloadFromCache(wlKey workload.Reference) *kueue.Workload
 	return nil
 }
 
+// PendingWorkloadsInSameRootCohorts returns pending workloads from all
+// ClusterQueues that share a root cohort with any of the provided ClusterQueues.
+// For ClusterQueues without a cohort, only that ClusterQueue is included.
+func (m *Manager) PendingWorkloadsInSameRootCohorts(cqNames []kueue.ClusterQueueReference) []workload.Info {
+	if len(cqNames) == 0 {
+		return nil
+	}
+
+	m.RLock()
+	defer m.RUnlock()
+
+	seenClusterQueues := sets.New[kueue.ClusterQueueReference]()
+	pending := make([]workload.Info, 0)
+	for _, cqName := range cqNames {
+		cq := m.hm.ClusterQueue(cqName)
+		if cq == nil {
+			continue
+		}
+		if cq.HasParent() {
+			pending = appendPendingWorkloadsInCohortSubtree(pending, cq.Parent().getRootUnsafe(), seenClusterQueues)
+			continue
+		}
+		pending = appendClusterQueuePendingWorkloads(pending, cq, seenClusterQueues)
+	}
+	return pending
+}
+
+func appendPendingWorkloadsInCohortSubtree(pending []workload.Info, cohort *cohort, seenClusterQueues sets.Set[kueue.ClusterQueueReference]) []workload.Info {
+	for _, clusterQueue := range cohort.ChildCQs() {
+		pending = appendClusterQueuePendingWorkloads(pending, clusterQueue, seenClusterQueues)
+	}
+	for _, childCohort := range cohort.ChildCohorts() {
+		pending = appendPendingWorkloadsInCohortSubtree(pending, childCohort, seenClusterQueues)
+	}
+	return pending
+}
+
+func appendClusterQueuePendingWorkloads(pending []workload.Info, cq *ClusterQueue, seenClusterQueues sets.Set[kueue.ClusterQueueReference]) []workload.Info {
+	if cq == nil {
+		return pending
+	}
+	cqName := cq.GetName()
+	if seenClusterQueues.Has(cqName) {
+		return pending
+	}
+	seenClusterQueues.Insert(cqName)
+	for _, info := range cq.Snapshot() {
+		if info == nil || info.Obj == nil {
+			continue
+		}
+		copyInfo := *info
+		copyInfo.ClusterQueue = cqName
+		pending = append(pending, copyInfo)
+	}
+	return pending
+}
+
 func (m *Manager) heads() []workload.Info {
 	workloads := m.secondPassQueue.takeAllReady()
 	for cqName, cq := range m.hm.ClusterQueues() {

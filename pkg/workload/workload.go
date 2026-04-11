@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +71,8 @@ const (
 
 	// SchedulingHashUnknown indicates the scheduling hash could not be computed.
 	SchedulingHashUnknown = "unknown"
+
+	podGroupTotalCountAnnotation = "kueue.x-k8s.io/pod-group-total-count"
 )
 
 var (
@@ -350,6 +353,72 @@ func computeSchedulingHash(log logr.Logger, wl *kueue.Workload, totalRequests []
 
 func (i *Info) CanBePartiallyAdmitted() bool {
 	return CanBePartiallyAdmitted(i.Obj)
+}
+
+func WorkerGPUStats(info *Info, gpuResource corev1.ResourceName) (int32, int64) {
+	var workerCount int32
+	var totalGPU int64
+	if info != nil {
+		for _, podSet := range info.TotalRequests {
+			workerCount += podSet.Count
+			totalGPU += podSet.SinglePodRequests()[gpuResource] * int64(podSet.Count)
+		}
+	}
+	if info == nil || info.Obj == nil {
+		return workerCount, totalGPU
+	}
+
+	var hintedWorkerCount int32
+	var hintedTotalGPU int64
+	for _, podSet := range info.Obj.Spec.PodSets {
+		count := podSet.Count
+		if raw := strings.TrimSpace(podSet.Template.Annotations[podGroupTotalCountAnnotation]); raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 32); err == nil && parsed > int64(count) {
+				count = int32(parsed)
+			}
+		}
+		if count <= 0 {
+			continue
+		}
+		var perPodGPU int64
+		for _, container := range podSet.Template.Spec.Containers {
+			if quantity, ok := container.Resources.Requests[gpuResource]; ok {
+				perPodGPU += quantity.Value()
+				continue
+			}
+			if quantity, ok := container.Resources.Limits[gpuResource]; ok {
+				perPodGPU += quantity.Value()
+			}
+		}
+		hintedWorkerCount += count
+		hintedTotalGPU += perPodGPU * int64(count)
+	}
+
+	if raw := strings.TrimSpace(info.Obj.Annotations[podGroupTotalCountAnnotation]); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 32); err == nil && parsed > 0 {
+			var perPodGPU int64
+			if len(info.TotalRequests) == 1 {
+				perPodGPU = info.TotalRequests[0].SinglePodRequests()[gpuResource]
+			}
+			if perPodGPU == 0 && len(info.Obj.Spec.PodSets) == 1 {
+				for _, container := range info.Obj.Spec.PodSets[0].Template.Spec.Containers {
+					if quantity, ok := container.Resources.Requests[gpuResource]; ok {
+						perPodGPU += quantity.Value()
+						continue
+					}
+					if quantity, ok := container.Resources.Limits[gpuResource]; ok {
+						perPodGPU += quantity.Value()
+					}
+				}
+			}
+			if perPodGPU > 0 {
+				hintedWorkerCount = max(hintedWorkerCount, int32(parsed))
+				hintedTotalGPU = max(hintedTotalGPU, perPodGPU*parsed)
+			}
+		}
+	}
+
+	return max(workerCount, hintedWorkerCount), max(totalGPU, hintedTotalGPU)
 }
 
 // Usage returns the total resource usage for the workload, including regular

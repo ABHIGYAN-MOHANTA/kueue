@@ -39,6 +39,7 @@ import (
 
 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/admissionadvisor"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
@@ -83,6 +84,10 @@ type Scheduler struct {
 	clock                   clock.Clock
 	roleTracker             *roletracker.RoleTracker
 	customLabels            *metrics.CustomLabels
+	admissionAdvisor        admissionadvisor.Client
+	cycleFlavorRankings     map[workload.Reference][]kueue.ResourceFlavorReference
+	cycleAdmissionGuard     admissionadvisor.ProtectedWorkloadPlan
+	stickyAdmissionGuard    admissionadvisor.ProtectedWorkloadPlan
 
 	// schedulingCycle identifies the number of scheduling
 	// attempts since the last restart.
@@ -97,6 +102,7 @@ type options struct {
 	roleTracker                 *roletracker.RoleTracker
 	preemptionExpectations      *expectations.Store
 	customLabels                *metrics.CustomLabels
+	admissionAdvisor            admissionadvisor.Client
 }
 
 // Option configures the reconciler.
@@ -156,6 +162,12 @@ func WithCustomLabels(cl *metrics.CustomLabels) Option {
 	}
 }
 
+func WithAdmissionAdvisor(advisor admissionadvisor.Client) Option {
+	return func(o *options) {
+		o.admissionAdvisor = advisor
+	}
+}
+
 func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recorder record.EventRecorder, opts ...Option) *Scheduler {
 	options := defaultOptions
 	for _, opt := range opts {
@@ -177,6 +189,7 @@ func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recor
 		admissionFairSharing:    options.admissionFairSharing,
 		roleTracker:             options.roleTracker,
 		customLabels:            options.customLabels,
+		admissionAdvisor:        options.admissionAdvisor,
 	}
 	return s
 }
@@ -258,6 +271,15 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 	}
 	logSnapshotIfVerbose(log, snapshot)
 	log.V(2).Info("Snapshot taken", "duration", s.clock.Since(phaseStartTime))
+
+	if ranked, flavorRankings, guardPlan, err := s.rankHeadWorkloads(ctx, headWorkloads, snapshot); err == nil {
+		headWorkloads = ranked
+		s.cycleFlavorRankings = flavorRankings
+		s.cycleAdmissionGuard = guardPlan
+	} else {
+		log.Error(err, "failed to obtain admission advisor ranking")
+		return wait.SlowDown
+	}
 
 	// 3. Calculate requirements (resource flavors, borrowing) for admitting workloads.
 	phaseStartTime = s.clock.Now()
@@ -438,6 +460,225 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 	return wait.KeepGoing
 }
 
+func (s *Scheduler) rankHeadWorkloads(ctx context.Context, workloads []workload.Info, snap *schdcache.Snapshot) ([]workload.Info, map[workload.Reference][]kueue.ResourceFlavorReference, admissionadvisor.ProtectedWorkloadPlan, error) {
+	if len(workloads) == 0 || snap == nil {
+		return workloads, nil, admissionadvisor.ProtectedWorkloadPlan{}, nil
+	}
+	guardScope := s.guardPlanScopeWorkloads(workloads)
+	if s.admissionAdvisor == nil || !s.admissionAdvisor.Enabled() {
+		s.stickyAdmissionGuard = admissionadvisor.ProtectedWorkloadPlan{}
+		return workloads, nil, admissionadvisor.ProtectedWorkloadPlan{}, nil
+	}
+
+	advice, err := s.admissionAdvisor.AdviseAdmission(ctx, guardScope, snap)
+	if err != nil {
+		return workloads, nil, admissionadvisor.ProtectedWorkloadPlan{}, err
+	}
+	guardPlan := stickyAdmissionGuardForScope(guardScope, advice.GuardPlan, s.stickyAdmissionGuard)
+	s.stickyAdmissionGuard = guardPlan
+	visible := ensureProtectedWorkloadVisible(workloads, guardScope, guardPlan)
+	if len(visible) <= 1 || len(advice.WorkloadScores) == 0 {
+		return visible, advice.FlavorRankings, guardPlan, nil
+	}
+
+	ranked := append([]workload.Info(nil), visible...)
+	slices.SortStableFunc(ranked, func(a, b workload.Info) int {
+		leftKey := workload.Key(a.Obj)
+		rightKey := workload.Key(b.Obj)
+		if guardPlan.Enabled() {
+			switch {
+			case leftKey == guardPlan.ProtectedWorkload && rightKey != guardPlan.ProtectedWorkload:
+				return -1
+			case rightKey == guardPlan.ProtectedWorkload && leftKey != guardPlan.ProtectedWorkload:
+				return 1
+			}
+		}
+		leftScore := advice.WorkloadScores[leftKey]
+		rightScore := advice.WorkloadScores[rightKey]
+		if leftScore != rightScore {
+			if leftScore > rightScore {
+				return -1
+			}
+			return 1
+		}
+		leftPriority := priority.EffectivePriority(ctrl.LoggerFrom(ctx), a.Obj)
+		rightPriority := priority.EffectivePriority(ctrl.LoggerFrom(ctx), b.Obj)
+		if leftPriority != rightPriority {
+			return cmp.Compare(rightPriority, leftPriority)
+		}
+		leftTS := s.workloadOrdering.GetQueueOrderTimestamp(a.Obj)
+		rightTS := s.workloadOrdering.GetQueueOrderTimestamp(b.Obj)
+		if !leftTS.Equal(rightTS) {
+			if leftTS.Before(rightTS) {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(leftKey, rightKey)
+	})
+	return ranked, advice.FlavorRankings, guardPlan, nil
+}
+
+func ensureProtectedWorkloadVisible(heads []workload.Info, scope []workload.Info, guardPlan admissionadvisor.ProtectedWorkloadPlan) []workload.Info {
+	if !guardPlan.Enabled() {
+		return heads
+	}
+	for _, info := range heads {
+		if info.Obj != nil && workload.Key(info.Obj) == guardPlan.ProtectedWorkload {
+			return heads
+		}
+	}
+	for _, info := range scope {
+		if info.Obj == nil || workload.Key(info.Obj) != guardPlan.ProtectedWorkload {
+			continue
+		}
+		visible := make([]workload.Info, 0, len(heads)+1)
+		visible = append(visible, info)
+		visible = append(visible, heads...)
+		return visible
+	}
+	return heads
+}
+
+func stickyAdmissionGuardForScope(scope []workload.Info, candidate, sticky admissionadvisor.ProtectedWorkloadPlan) admissionadvisor.ProtectedWorkloadPlan {
+	if candidate.Enabled() {
+		return candidate
+	}
+	if !sticky.Enabled() {
+		return admissionadvisor.ProtectedWorkloadPlan{}
+	}
+	for _, info := range scope {
+		if info.Obj != nil && workload.Key(info.Obj) == sticky.ProtectedWorkload {
+			return sticky
+		}
+	}
+	return admissionadvisor.ProtectedWorkloadPlan{}
+}
+
+func (s *Scheduler) guardPlanScopeWorkloads(heads []workload.Info) []workload.Info {
+	if len(heads) == 0 {
+		return nil
+	}
+	expanded := make([]workload.Info, 0, len(heads))
+	seenWorkloads := make(map[workload.Reference]struct{}, len(heads))
+	scopeClusterQueues := make([]kueue.ClusterQueueReference, 0, len(heads))
+	seenClusterQueues := make(map[kueue.ClusterQueueReference]struct{}, len(heads))
+
+	for _, info := range heads {
+		if info.Obj == nil {
+			continue
+		}
+		key := workload.Key(info.Obj)
+		if _, found := seenWorkloads[key]; found {
+			continue
+		}
+		seenWorkloads[key] = struct{}{}
+		expanded = append(expanded, info)
+		if _, found := seenClusterQueues[info.ClusterQueue]; found {
+			continue
+		}
+		seenClusterQueues[info.ClusterQueue] = struct{}{}
+		scopeClusterQueues = append(scopeClusterQueues, info.ClusterQueue)
+	}
+
+	if s.queues == nil {
+		return expanded
+	}
+	for _, info := range s.queues.PendingWorkloadsInSameRootCohorts(scopeClusterQueues) {
+		if info.Obj == nil {
+			continue
+		}
+		key := workload.Key(info.Obj)
+		if _, found := seenWorkloads[key]; found {
+			continue
+		}
+		seenWorkloads[key] = struct{}{}
+		expanded = append(expanded, info)
+	}
+
+	return expanded
+}
+
+func workloadWorkerStats(wl *workload.Info) (int32, int64) {
+	return workload.WorkerGPUStats(wl, corev1.ResourceName("admirl.ai/gpu"))
+}
+
+func assignmentFlavors(assignment flavorassigner.Assignment) map[kueue.ResourceFlavorReference]struct{} {
+	result := make(map[kueue.ResourceFlavorReference]struct{})
+	for _, podSet := range assignment.PodSets {
+		for _, flvAssignment := range podSet.Flavors {
+			if flvAssignment == nil {
+				continue
+			}
+			result[flvAssignment.Name] = struct{}{}
+		}
+	}
+	return result
+}
+
+func (s *Scheduler) shouldDelayForProtectedGang(wl *workload.Info, assignment flavorassigner.Assignment) bool {
+	guard := s.cycleAdmissionGuard
+	if !guard.Enabled() || wl == nil || wl.Obj == nil {
+		return false
+	}
+	if workload.Key(wl.Obj) == guard.ProtectedWorkload {
+		return false
+	}
+	if assignment.RepresentativeMode() != flavorassigner.Fit {
+		return false
+	}
+	workerCount, totalGPU := workloadWorkerStats(wl)
+	if workerCount >= 2 {
+		return false
+	}
+	if totalGPU >= guard.ProtectedTotalGPU && workerCount >= guard.ProtectedWorkerCount {
+		return false
+	}
+	for flavor := range assignmentFlavors(assignment) {
+		if guard.ProtectsFlavor(flavor) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) shouldKeepProtectedGangHot(wl *workload.Info, assignment flavorassigner.Assignment, snap *schdcache.Snapshot) bool {
+	if wl == nil || wl.Obj == nil || assignment.RepresentativeMode() == flavorassigner.Fit {
+		return false
+	}
+
+	guard := s.cycleAdmissionGuard
+	if guard.Enabled() && workload.Key(wl.Obj) == guard.ProtectedWorkload {
+		return true
+	}
+
+	workerCount, totalGPU := workloadWorkerStats(wl)
+	if workerCount < 2 || totalGPU <= 0 || snap == nil {
+		return false
+	}
+
+	cq := snap.ClusterQueue(wl.ClusterQueue)
+	if cq == nil {
+		return false
+	}
+	resourceGroup := cq.RGByResource(corev1.ResourceName("admirl.ai/gpu"))
+	if resourceGroup == nil {
+		return false
+	}
+
+	if cq.HasParent() {
+		return true
+	}
+
+	for _, flavor := range resourceGroup.Flavors {
+		fr := resources.FlavorResource{Flavor: flavor, Resource: corev1.ResourceName("admirl.ai/gpu")}
+		if cq.QuotaFor(fr).Nominal >= totalGPU {
+			return true
+		}
+	}
+	return false
+}
+
 type entryStatus string
 
 const (
@@ -506,6 +747,15 @@ func (s *Scheduler) nominate(ctx context.Context, workloads []workload.Info, sna
 			e.assignment, e.preemptionTargets = s.getAssignments(log, &e.Info, snap)
 			e.inadmissibleMsg = e.assignment.Message()
 			e.LastAssignment = &e.assignment.LastState
+			if s.shouldKeepProtectedGangHot(&e.Info, e.assignment, snap) {
+				e.requeueReason = qcache.RequeueReasonProtectedOlderGang
+			}
+			if s.shouldDelayForProtectedGang(&e.Info, e.assignment) {
+				e.inadmissibleMsg = fmt.Sprintf("Protected older gang %s is waiting for overlapping flavor capacity", s.cycleAdmissionGuard.ProtectedWorkload)
+				inadmissibleEntries = append(inadmissibleEntries, e)
+				log.V(2).Info("Skipping workload to protect blocked older gang", "protectedWorkload", s.cycleAdmissionGuard.ProtectedWorkload)
+				continue
+			}
 			entries = append(entries, e)
 			continue
 		}
@@ -597,10 +847,44 @@ func (s *Scheduler) getAssignments(log logr.Logger, wl *workload.Info, snap *sch
 // If no valid assignment can be made, returns the original full assignment with no preemption targets.
 func (s *Scheduler) getInitialAssignments(log logr.Logger, wl *workload.Info, snap *schdcache.Snapshot) (flavorassigner.Assignment, []*preemption.Target) {
 	cq := snap.ClusterQueue(wl.ClusterQueue)
+	if cq == nil {
+		return flavorassigner.Assignment{}, nil
+	}
+
+	assignerCQ := cq
+	if ranked := s.cycleFlavorRankings[workload.Key(wl.Obj)]; len(ranked) > 0 {
+		cloned := *cq
+		cloned.ResourceGroups = append([]schdcache.ResourceGroup(nil), cq.ResourceGroups...)
+		orderIndex := make(map[kueue.ResourceFlavorReference]int, len(ranked))
+		for idx, flavor := range ranked {
+			orderIndex[flavor] = idx
+		}
+		for idx := range cloned.ResourceGroups {
+			group := cloned.ResourceGroups[idx]
+			group.Flavors = append([]kueue.ResourceFlavorReference(nil), group.Flavors...)
+			slices.SortStableFunc(group.Flavors, func(a, b kueue.ResourceFlavorReference) int {
+				leftRank, leftOK := orderIndex[a]
+				rightRank, rightOK := orderIndex[b]
+				switch {
+				case leftOK && rightOK && leftRank != rightRank:
+					return cmp.Compare(leftRank, rightRank)
+				case leftOK != rightOK:
+					if leftOK {
+						return -1
+					}
+					return 1
+				default:
+					return cmp.Compare(string(a), string(b))
+				}
+			})
+			cloned.ResourceGroups[idx] = group
+		}
+		assignerCQ = &cloned
+	}
 
 	preemptionTargets, replaceableWorkloadSlice := workloadslicing.ReplacedWorkloadSlice(wl, snap)
 
-	flvAssigner := flavorassigner.New(wl, cq, snap.ResourceFlavors, fairsharing.Enabled(s.fairSharing), preemption.NewOracle(s.preemptor, snap), replaceableWorkloadSlice)
+	flvAssigner := flavorassigner.New(wl, assignerCQ, snap.ResourceFlavors, fairsharing.Enabled(s.fairSharing), preemption.NewOracle(s.preemptor, snap), replaceableWorkloadSlice)
 	fullAssignment := flvAssigner.Assign(log, nil)
 
 	arm := fullAssignment.RepresentativeMode()

@@ -247,6 +247,9 @@ var (
 			kueue.Workload{}, "TypeMeta",
 			"ObjectMeta.ResourceVersion",
 		),
+		cmpopts.IgnoreMapEntries(func(k, _ string) bool {
+			return k == podconstants.GroupTotalCountAnnotation
+		}),
 		cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime"),
 	}
 )

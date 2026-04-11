@@ -59,6 +59,7 @@ const (
 	RequeueReasonPreemptionGated       RequeueReason = "PreemptionGated"
 	RequeueReasonPendingPreemption     RequeueReason = "PendingPreemption"
 	RequeueReasonPreemptionFailed      RequeueReason = "PreemptionFailed"
+	RequeueReasonProtectedOlderGang    RequeueReason = "ProtectedOlderGang"
 )
 
 var (
@@ -144,6 +145,18 @@ func (c *ClusterQueue) GetName() kueue.ClusterQueueReference {
 
 func workloadKey(i *workload.Info) workload.Reference {
 	return workload.Key(i.Obj)
+}
+
+func workloadWorkerGPUStats(info *workload.Info) (int32, int64) {
+	return workload.WorkerGPUStats(info, corev1.ResourceName("admirl.ai/gpu"))
+}
+
+func (c *ClusterQueue) shouldProtectGenericRequeue(info *workload.Info, reason RequeueReason) bool {
+	if reason != RequeueReasonGeneric || c.queueingStrategy != kueue.BestEffortFIFO || !c.HasParent() {
+		return false
+	}
+	workerCount, totalGPU := workloadWorkerGPUStats(info)
+	return workerCount >= 2 && totalGPU > 0
 }
 
 type clusterQueueOption func(*clusterQueueOptions)
@@ -393,6 +406,10 @@ func (c *ClusterQueue) DeleteFromLocalQueue(log logr.Logger, q *LocalQueue, role
 // the workload will be pushed back to heap directly. Otherwise, the workload
 // will be put into the inadmissibleWorkloads.
 func (c *ClusterQueue) requeueIfNotPresent(log logr.Logger, wInfo *workload.Info, immediate bool) bool {
+	return c.requeueIfNotPresentInternal(log, wInfo, immediate, false)
+}
+
+func (c *ClusterQueue) requeueIfNotPresentInternal(log logr.Logger, wInfo *workload.Info, immediate bool, ignoreBackoff bool) bool {
 	c.rwm.Lock()
 	defer c.rwm.Unlock()
 	key := workload.Key(wInfo.Obj)
@@ -400,7 +417,7 @@ func (c *ClusterQueue) requeueIfNotPresent(log logr.Logger, wInfo *workload.Info
 
 	inadmissibleWl := c.inadmissibleWorkloads.get(key)
 
-	if c.backoffWaitingTimeExpired(wInfo) &&
+	if (ignoreBackoff || c.backoffWaitingTimeExpired(wInfo)) &&
 		(immediate || c.queueInadmissibleCycle >= c.popCycle || wInfo.LastAssignment.PendingFlavors()) {
 		// If the workload was inadmissible, move it back into the queue.
 		if inadmissibleWl != nil {
@@ -719,11 +736,15 @@ func (c *ClusterQueue) Active() bool {
 // The workload should not be reinserted if it's already in the ClusterQueue.
 // Returns true if the workload was inserted.
 func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.Info, reason RequeueReason) bool {
+	if c.shouldProtectGenericRequeue(wInfo, reason) {
+		reason = RequeueReasonProtectedOlderGang
+	}
+
 	// when preemptions are in-progress, we keep attempting to
 	// schedule the same workload for BestEffortFIFO queues. See
 	// documentation of stickyWorkload for more details
 	log := ctrl.LoggerFrom(ctx)
-	if reason == RequeueReasonPendingPreemption && c.queueingStrategy == kueue.BestEffortFIFO {
+	if (reason == RequeueReasonPendingPreemption || reason == RequeueReasonProtectedOlderGang) && c.queueingStrategy == kueue.BestEffortFIFO {
 		if logV := log.V(5); logV.Enabled() {
 			logV.Info("Setting sticky workload", "clusterQueue", wInfo.ClusterQueue, "workload", workload.Key(wInfo.Obj))
 		}
@@ -736,9 +757,10 @@ func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.
 	} else {
 		immediate = reason == RequeueReasonFailedAfterNomination ||
 			reason == RequeueReasonPendingPreemption ||
-			reason == RequeueReasonPreemptionFailed
+			reason == RequeueReasonPreemptionFailed ||
+			reason == RequeueReasonProtectedOlderGang
 	}
-	return c.requeueIfNotPresent(log, wInfo, immediate)
+	return c.requeueIfNotPresentInternal(log, wInfo, immediate, reason == RequeueReasonProtectedOlderGang)
 }
 
 // baseCompareFunc orders workloads by sticky status, priority, timestamp, and UID.
